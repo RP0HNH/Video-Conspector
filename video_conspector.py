@@ -40,7 +40,10 @@ def format_timestamp(seconds: float) -> str:
 def run_ffmpeg(args: list) -> None:
     """Запускает ffmpeg и выбрасывает RuntimeError при ошибке."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg завершился с ошибкой: {result.stderr.strip()}")
 
@@ -446,36 +449,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    """Оркестрирует весь процесс и возвращает код выхода."""
-    setup_logging()
-    args = parse_args()
-    if args.whisper_model:
-        config.WHISPER_MODEL = args.whisper_model
+def run_pipeline(
+    url: str,
+    output_dir: Path,
+    interval: int = config.FRAME_INTERVAL,
+    keep_temp: bool = False,
+    make_concepts: bool = True,
+    include_transcript: bool = True,
+) -> tuple:
+    """Выполняет весь процесс; возвращает (статус, путь к результату).
 
-    output_dir = Path(args.output)
+    Статус: "ok" — заметка создана, "raw" — LM Studio недоступна и сохранён
+    сырой текст, "error" — результата нет.
+    """
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix="video_conspector_"))
 
     try:
         logger.info("Скачивание видео...")
-        downloaded = download_video(args.url, temp_dir)
+        downloaded = download_video(url, temp_dir)
         if downloaded is None:
-            return 1
+            return "error", None
         video_path, info = downloaded
 
         logger.info("Распознавание речи...")
         transcript = transcribe_audio(video_path)
 
         logger.info("Извлечение кадров...")
-        frames_dir = extract_frames(video_path, temp_dir, args.interval)
+        frames_dir = extract_frames(video_path, temp_dir, interval)
 
         logger.info("Распознавание кода на кадрах (OCR)...")
-        ocr_text = extract_code_from_frames(frames_dir, args.interval)
+        ocr_text = extract_code_from_frames(frames_dir, interval)
 
         if not transcript and not ocr_text:
             logger.error("Не удалось получить ни транскрипт, ни текст с экрана.")
-            return 1
+            return "error", None
 
         logger.info("Генерация конспекта...")
         try:
@@ -485,25 +494,39 @@ def main() -> int:
             logger.error(
                 "LM Studio недоступна. Сырой текст сохранён: %s", raw_path
             )
-            return 0
+            return "raw", raw_path
 
         title, text = obsidian_note.render_note(
             parts, info, transcript, has_code=bool(ocr_text.strip()),
-            include_transcript=not args.no_transcript,
+            include_transcript=include_transcript,
         )
         note_path = obsidian_note.note_path(output_dir, title, info)
         note_path.write_text(text + "\n", encoding="utf-8")
-        if not args.no_concepts and parts["meta"]["concepts"]:
+        if make_concepts and parts["meta"]["concepts"]:
             obsidian_note.write_concept_stubs(
                 output_dir, parts["meta"]["concepts"], note_path.stem
             )
         logger.info("Готово: %s", note_path)
-        return 0
+        return "ok", note_path
     finally:
-        if args.keep_temp:
+        if keep_temp:
             logger.info("Временные файлы: %s", temp_dir)
         else:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def main() -> int:
+    """Точка входа CLI; возвращает код выхода."""
+    setup_logging()
+    args = parse_args()
+    if args.whisper_model:
+        config.WHISPER_MODEL = args.whisper_model
+    status, _ = run_pipeline(
+        args.url, Path(args.output), args.interval, args.keep_temp,
+        make_concepts=not args.no_concepts,
+        include_transcript=not args.no_transcript,
+    )
+    return 1 if status == "error" else 0
 
 
 if __name__ == "__main__":

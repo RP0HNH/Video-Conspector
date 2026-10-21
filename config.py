@@ -2,11 +2,14 @@
 
 import os
 import re
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).resolve().parent
+# В собранном exe настройки (.env) лежат рядом с исполняемым файлом
+BASE_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+            else Path(__file__).resolve().parent)
 load_dotenv(BASE_DIR / ".env")
 
 # LM Studio
@@ -25,7 +28,7 @@ WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE") or None
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 # VAD (onnxruntime) отсекает тишину; отключите, если процесс падает
-WHISPER_VAD = os.getenv("WHISPER_VAD", "1") == "1"
+WHISPER_VAD = os.getenv("WHISPER_VAD", "0") == "1"
 
 # Видео и кадры
 MAX_VIDEO_HEIGHT = 1080

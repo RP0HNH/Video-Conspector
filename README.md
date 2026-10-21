@@ -1,4 +1,4 @@
-# Video Conspector
+﻿# Video Conspector
 
 CLI-утилита: скачивает YouTube-видео, распознаёт речь (faster-whisper), читает код с экрана (Tesseract OCR) и строит Markdown-конспект через локальный LM Studio.
 
@@ -60,3 +60,18 @@ lms load qwen/qwen2.5-coder-14b --context-length 16384 --gpu max -y
 
 Если код на экране не найден, в начало `summary.md` добавляется пометка.
 
+## Графический интерфейс и exe
+
+Окно с индикатором связи с LM Studio, полем для ссылки, выбором папки и журналом:
+
+```bash
+python gui.py
+```
+
+Сборка exe (результат в `dist\VideoConspector\VideoConspector.exe`, запускать нужно из этой папки целиком):
+
+```bash
+powershell -File build_exe.ps1
+```
+
+FFmpeg и Tesseract по-прежнему должны быть установлены в системе. Файл `.env` кладётся рядом с exe. `onnxruntime` в exe не включён, поэтому VAD (`WHISPER_VAD=1`) в нём недоступен.
