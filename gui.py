@@ -287,8 +287,32 @@ class App(tk.Tk):
         os.startfile(folder)  # noqa: S606
 
 
+def selftest(audio: Path, report: Path) -> None:
+    """Проверяет зависимости и распознаёт короткое аудио; пишет отчёт в файл."""
+    lines = []
+    try:
+        import av  # noqa: F401
+        import ctranslate2
+        import faster_whisper
+        import pytesseract
+        import yt_dlp  # noqa: F401
+        lines.append(f"imports ok (ctranslate2 {ctranslate2.__version__}, "
+                     f"faster_whisper {faster_whisper.__version__})")
+        lines.append(f"ffmpeg: {bool(__import__('shutil').which('ffmpeg'))}")
+        lines.append(f"tesseract: {config.TESSERACT_CMD or pytesseract.pytesseract.tesseract_cmd}")
+        text = vc.transcribe_audio(audio)
+        lines.append(f"transcript: {text!r}")
+    except Exception as exc:  # отчёт важнее трассировки
+        lines.append(f"FAILED: {type(exc).__name__}: {exc}")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main() -> None:
-    """Запускает окно; `--run URL ПАПКА` выполняет обработку без окна."""
+    """Запускает окно; `--run URL ПАПКА` — обработка без окна,
+    `--selftest АУДИО ОТЧЁТ` — проверка сборки."""
+    if len(sys.argv) == 4 and sys.argv[1] == "--selftest":
+        selftest(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
     if len(sys.argv) == 4 and sys.argv[1] == "--run":
         log_file = Path(sys.argv[3]) / "run.log"
         Path(sys.argv[3]).mkdir(parents=True, exist_ok=True)

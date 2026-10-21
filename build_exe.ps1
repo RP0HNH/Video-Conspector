@@ -1,18 +1,38 @@
-﻿# Build VideoConspector.exe into dist\VideoConspector (run from the project root).
-# Needs the environment with project dependencies installed.
-$python = if (Test-Path ".\.venv\Scripts\python.exe") { ".\.venv\Scripts\python.exe" } else { "python" }
+﻿# Build VideoConspector.exe -> dist\VideoConspector (onedir).
+# Usage: powershell -File build_exe.ps1 [-Clean]
+#   -Clean  drop the PyInstaller cache (build\) before building.
+# The build always runs inside .venv created from a non-Anaconda Python.
+param([switch]$Clean)
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
-& $python -m pip install -q pyinstaller
-& $python -m PyInstaller --noconfirm --clean --windowed --name VideoConspector `
-    --collect-all faster_whisper --collect-all ctranslate2 `
-    --collect-all av --collect-all yt_dlp `
-    --collect-all tokenizers --collect-all pytesseract `
-    --hidden-import pkg_resources --exclude-module onnxruntime `
-    gui.py
+$venvPython = ".\.venv\Scripts\python.exe"
+$cfg = if (Test-Path ".venv\pyvenv.cfg") { Get-Content ".venv\pyvenv.cfg" -Raw } else { "" }
 
-if ($LASTEXITCODE -eq 0) {
-    Copy-Item .env.example dist\VideoConspector\.env.example -Force
-    Write-Host "Done: dist\VideoConspector\VideoConspector.exe"
+# A venv based on Anaconda makes PyInstaller scan conda DLLs and packages.
+if ((Test-Path $venvPython) -and $cfg -match "(?i)conda") {
+    Write-Host "The existing .venv is based on Anaconda - recreating it."
+    Remove-Item -Recurse -Force .venv
 }
 
+if (-not (Test-Path $venvPython)) {
+    $base = $null
+    foreach ($candidate in @("-3.12", "-3.11", "-3.10")) {
+        $path = & py $candidate -c "import sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $path -and $path -notmatch "(?i)conda") { $base = $candidate; break }
+    }
+    if (-not $base) { throw "Install Python 3.10-3.12 from python.org (Anaconda is not supported)." }
+    Write-Host "Creating .venv with py $base"
+    & py $base -m venv .venv
+}
 
+& $venvPython -m pip install -q --disable-pip-version-check -r requirements.txt pyinstaller
+if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+
+$pyArgs = @("--noconfirm")
+if ($Clean) { $pyArgs += "--clean" }
+& $venvPython -m PyInstaller @pyArgs VideoConspector.spec
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
+
+Copy-Item .env.example dist\VideoConspector\.env.example -Force
+Write-Host "Done: dist\VideoConspector\VideoConspector.exe"

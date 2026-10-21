@@ -6,6 +6,5 @@ outputs/
 *.log
 build/
 dist/
-*.spec
 gui_settings.json
 .idea/
