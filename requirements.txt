@@ -1,0 +1,12 @@
+yt-dlp
+faster-whisper
+# Закреплённые версии: ctranslate2 4.8.x падает (access violation) на части
+# систем Windows, а av 19 несовместим с faster-whisper 1.2.1.
+ctranslate2==4.5.0
+av==16.0.1
+setuptools<81
+pytesseract
+Pillow
+requests
+opencv-python
+python-dotenv
