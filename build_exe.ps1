@@ -2,7 +2,7 @@
 # Usage: powershell -File build_exe.ps1 [-Clean]
 #   -Clean  drop the PyInstaller cache (build\) before building.
 # The build always runs inside .venv created from a non-Anaconda Python.
-param([switch]$Clean)
+param([switch]$Clean, [switch]$NoOpen)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -29,10 +29,17 @@ if (-not (Test-Path $venvPython)) {
 & $venvPython -m pip install -q --disable-pip-version-check -r requirements.txt pyinstaller
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
-$pyArgs = @("--noconfirm")
+# Intermediate files go to .pyi_cache. The old build\ folder held a half-made
+# VideoConspector.exe without _internal that is easy to launch by mistake.
+if (Test-Path build) { Remove-Item -Recurse -Force build }
+$pyArgs = @("--noconfirm", "--workpath", ".pyi_cache")
 if ($Clean) { $pyArgs += "--clean" }
 & $venvPython -m PyInstaller @pyArgs VideoConspector.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
 Copy-Item .env.example dist\VideoConspector\.env.example -Force
-Write-Host "Done: dist\VideoConspector\VideoConspector.exe"
+$exe = (Resolve-Path dist\VideoConspector\VideoConspector.exe).Path
+Write-Host ""
+Write-Host "DONE. Run this file (keep the whole folder next to it):"
+Write-Host $exe
+if (-not $NoOpen) { Invoke-Item (Split-Path $exe) }

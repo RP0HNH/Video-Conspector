@@ -69,9 +69,14 @@ class _QueueHandler(logging.Handler):
     def __init__(self, target: queue.Queue):
         super().__init__(logging.INFO)
         self.target = target
+        self.last_error = ""
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.target.put(("log", self.format(record)))
+        message = self.format(record)
+        if record.levelno >= logging.ERROR:
+            self.last_error = record.getMessage()
+        if "HTTP Request:" not in message:  # служебный шум библиотек
+            self.target.put(("log", message))
 
 
 class App(tk.Tk):
@@ -159,8 +164,17 @@ class App(tk.Tk):
 
     def _setup_logging(self) -> None:
         handler = _QueueHandler(self.messages)
+        self.queue_handler = handler
         handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S"))
         logging.getLogger().addHandler(handler)
+        try:  # полный журнал рядом с программой — удобно присылать при ошибках
+            file_handler = logging.FileHandler(
+                config.BASE_DIR / "video_conspector.log", encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s"))
+            logging.getLogger().addHandler(file_handler)
+        except OSError:
+            pass
         logging.getLogger().setLevel(logging.INFO)
         # Служебные сообщения библиотек в окне не нужны
         for noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
@@ -229,17 +243,21 @@ class App(tk.Tk):
         config.WHISPER_MODEL = self.model_var.get()
         output = Path(self.out_var.get())
         self.result_path = None
+        self.queue_handler.last_error = ""
         self.open_note_btn.configure(state="disabled")
         self.start_btn.configure(state="disabled")
         self.progress.start(12)
         self.status_var.set("Идёт обработка... Окно можно не закрывать.")
+        # tkinter-переменные читаем здесь: из фонового потока это небезопасно
+        make_concepts = self.concepts_var.get()
+        include_transcript = self.transcript_var.get()
 
         def work() -> None:
             try:
                 result = vc.run_pipeline(
                     url, output,
-                    make_concepts=self.concepts_var.get(),
-                    include_transcript=self.transcript_var.get(),
+                    make_concepts=make_concepts,
+                    include_transcript=include_transcript,
                 )
             except Exception as exc:  # окно не должно падать из-за сбоя
                 logging.getLogger("video_conspector").exception("Сбой: %s", exc)
@@ -255,6 +273,11 @@ class App(tk.Tk):
         self.result_path = path
         if path:
             self.open_note_btn.configure(state="normal")
+        if status == "error":
+            reason = self.queue_handler.last_error or "см. журнал в окне"
+            messagebox.showerror(
+                "Ошибка", f"{reason}\n\nПолный журнал: "
+                f"{config.BASE_DIR / 'video_conspector.log'}")
         self.status_var.set({
             "ok": f"Готово: {path.name}" if path else "Готово.",
             "raw": "LM Studio недоступна — сохранён только сырой текст.",

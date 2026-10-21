@@ -8,3 +8,4 @@ build/
 dist/
 gui_settings.json
 .idea/
+.pyi_cache/

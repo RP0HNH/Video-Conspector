@@ -202,6 +202,13 @@ def extract_code_from_frames(
 
         if config.TESSERACT_CMD:
             pytesseract.pytesseract.tesseract_cmd = config.TESSERACT_CMD
+        # Берём только установленные языки, чтобы не падать без rus
+        try:
+            installed = set(pytesseract.get_languages(config=""))
+            wanted = [x for x in config.OCR_LANGS.split("+") if x in installed]
+            config.OCR_LANGS = "+".join(wanted) or config.OCR_LANGS
+        except Exception as exc:
+            logger.warning("Не удалось получить языки Tesseract: %s", exc)
 
         blocks = []
         seen = []
