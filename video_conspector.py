@@ -24,9 +24,11 @@ logger = logging.getLogger("video_conspector")
 _TS_LINE_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\]")
 # Строки-«вода»: пересказ действий автора вместо фактов
 _FILLER_RE = re.compile(
-    r"^\s*(?:[-*•]\s*)?(?:автор|ведущий|спикер|рассказчик)\s+"
-    r"(?:показыва|рассказ|объясня|демонстр|говорит|упомина|благодар|"
-    r"приветств|заканчива|завершает|подчёркива|подчеркива|призыва)",
+    r"^\s*(?:[-*•]\s*)?(?:\[\d\d:\d\d:\d\d\]\s*)?(?:автор|ведущий|спикер|"
+    r"рассказчик)\s+(?:показыва|рассказ|объясня|демонстр|говорит|упомина|"
+    r"благодар|приветств|заканчива|завершает|подчёркива|подчеркива|призыва|"
+    r"предлага|просит)"
+    r"|(?:оставить комментари|поставить лайк|подпишитесь|подписыва)",
     re.I,
 )
 
@@ -398,6 +400,29 @@ def _split_transcript(transcript: str, size: int) -> list:
     return chunks
 
 
+def _fix_timestamps(body: str, chunk: str) -> str:
+    """Привязывает таймкоды ответа к реальным таймкодам фрагмента.
+
+    Модель иногда выдумывает таймкоды (например, 00:01:73); такие значения
+    заменяются ближайшим настоящим из фрагмента.
+    """
+    real = sorted({
+        int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        for m in re.finditer(r"^\[(\d{2}):(\d{2}):(\d{2})\]", chunk, re.M)
+    })
+    if not real:
+        return body
+
+    def snap(match: re.Match) -> str:
+        h, m, s = (int(g) for g in match.groups())
+        value = h * 3600 + m * 60 + s
+        if m < 60 and s < 60 and value in real:
+            return match.group(0)
+        return f"[{format_timestamp(min(real, key=lambda r: abs(r - value)))}]"
+
+    return re.sub(r"\[(\d{2}):(\d{2}):(\d{2})\]", snap, body)
+
+
 def _parse_section(answer: str, index: int) -> tuple:
     """Отделяет заголовок раздела (первая строка) от текста, убирает воду."""
     lines = answer.strip().splitlines()
@@ -505,7 +530,8 @@ def summarize_with_lm_studio(
                     chunk=chunk),
                 size["section_tokens"],
             )
-            sections.append((start, *_parse_section(answer, i)))
+            heading, body = _parse_section(answer, i)
+            sections.append((start, heading, _fix_timestamps(body, chunk)))
 
         notes = "\n\n".join(f"{h}\n{b}" for _, h, b in sections)
         report(D_SUMMARY, len(chunks) / steps, "Название, теги, понятия")

@@ -159,10 +159,18 @@ class LMStudioTests(unittest.TestCase):
         answer = vc._chat("слово " * 2000, 100)
         self.assertIn("Заголовок раздела", answer)
 
+    def test_invented_timestamps_snap_to_real_ones(self):
+        chunk = "[00:01:00] a\n[00:01:30] b\n[00:02:10] c"
+        body = "[00:01:30] ok, [00:01:73] bad, [00:09:00] far, [00:00:55] early"
+        fixed = vc._fix_timestamps(body, chunk)
+        self.assertEqual(
+            fixed,
+            "[00:01:30] ok, [00:02:10] bad, [00:02:10] far, [00:01:00] early")
+
     def test_budgets_follow_context(self):
-        small, large = lmstudio.budgets(4096), lmstudio.budgets(32768)
+        small, large = lmstudio.budgets(3000), lmstudio.budgets(32768)
         self.assertLess(small["chunk_chars"], large["chunk_chars"])
-        self.assertLessEqual(large["chunk_chars"], 6000)
+        self.assertLessEqual(large["chunk_chars"], 3500)
 
 
 if __name__ == "__main__":

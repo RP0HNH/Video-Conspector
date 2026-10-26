@@ -166,7 +166,7 @@ def budgets(context: Optional[int]) -> dict:
     code_tokens = _clamp(ctx // 3, 800, 3500)
     meta_tokens = _clamp(ctx // 3, 800, 2000)
     return {
-        "chunk_chars": _clamp((ctx - section_tokens - 900) * 2.2, 2000, 6000),
+        "chunk_chars": _clamp((ctx - section_tokens - 900) * 2.2, 2000, 3500),
         "section_tokens": section_tokens,
         "meta_chars": _clamp((ctx - meta_tokens - 700) * 2.0, 3000, 14000),
         "meta_tokens": meta_tokens,
