@@ -9,3 +9,4 @@ pytesseract
 Pillow
 requests
 python-dotenv
+sv-ttk

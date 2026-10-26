@@ -9,17 +9,51 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
 import config
+import lmstudio
 import obsidian_note
 
 logger = logging.getLogger("video_conspector")
 
 _TS_LINE_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\]")
+# Строки-«вода»: пересказ действий автора вместо фактов
+_FILLER_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:автор|ведущий|спикер|рассказчик)\s+"
+    r"(?:показыва|рассказ|объясня|демонстр|говорит|упомина|благодар|"
+    r"приветств|заканчива|завершает|подчёркива|подчеркива|призыва)",
+    re.I,
+)
+
+STAGES = ("Скачивание", "Речь", "Кадры", "Код на экране", "Конспект",
+          "Сохранение")
+D_DOWNLOAD, D_SPEECH, D_FRAMES, D_OCR, D_SUMMARY, D_SAVE = range(6)
+
+cancel_event = threading.Event()
+# Получатель прогресса: callable(этап, доля 0..1, пояснение)
+progress_hook: Optional[Callable] = None
+
+
+class Cancelled(BaseException):
+    """Пользователь отменил обработку (не Exception, чтобы её не глотали)."""
+
+
+def check_cancel() -> None:
+    """Прерывает работу, если запрошена отмена."""
+    if cancel_event.is_set():
+        raise Cancelled()
+
+
+def report(stage: int, fraction: float = 0.0, detail: str = "") -> None:
+    """Сообщает интерфейсу о ходе работы."""
+    check_cancel()
+    if progress_hook:
+        progress_hook(stage, max(0.0, min(1.0, fraction)), detail)
 
 
 def setup_logging() -> None:
@@ -38,14 +72,37 @@ def format_timestamp(seconds: float) -> str:
 
 
 def run_ffmpeg(args: list) -> None:
-    """Запускает ffmpeg и выбрасывает RuntimeError при ошибке."""
+    """Запускает ffmpeg (с возможностью отмены); RuntimeError при ошибке."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg завершился с ошибкой: {result.stderr.strip()}")
+    while True:
+        try:
+            _, stderr = proc.communicate(timeout=0.3)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event.is_set():
+                proc.kill()
+                proc.communicate()
+                raise Cancelled()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg завершился с ошибкой: {stderr.strip()}")
+
+
+def fetch_title(url: str) -> Optional[str]:
+    """Возвращает название видео без скачивания (None при ошибке)."""
+    try:
+        import yt_dlp
+
+        options = {"quiet": True, "no_warnings": True, "noplaylist": True,
+                   "skip_download": True, "extract_flat": "in_playlist"}
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(url, download=False).get("title")
+    except Exception as exc:
+        logger.debug("Название не получено: %s", exc)
+        return None
 
 
 def download_video(url: str, temp_dir: Path) -> Optional[tuple]:
@@ -53,6 +110,13 @@ def download_video(url: str, temp_dir: Path) -> Optional[tuple]:
 
     Возвращает (путь к файлу, метаданные видео) или None при ошибке.
     """
+    def on_progress(data: dict) -> None:
+        total = data.get("total_bytes") or data.get("total_bytes_estimate")
+        if data.get("status") == "downloading" and total:
+            report(D_DOWNLOAD, data.get("downloaded_bytes", 0) / total)
+        else:
+            check_cancel()
+
     try:
         import yt_dlp
 
@@ -66,6 +130,7 @@ def download_video(url: str, temp_dir: Path) -> Optional[tuple]:
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "progress_hooks": [on_progress],
         }
         with yt_dlp.YoutubeDL(options) as ydl:
             raw_info = ydl.extract_info(url, download=True)
@@ -86,10 +151,12 @@ def transcribe_audio(video_path: Path) -> str:
     try:
         from faster_whisper import WhisperModel
 
+        report(D_SPEECH, 0.0, "Извлечение звука")
         run_ffmpeg(
             ["-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
              str(audio_path)]
         )
+        report(D_SPEECH, 0.0, f"Загрузка модели {config.WHISPER_MODEL}")
         model = WhisperModel(
             config.WHISPER_MODEL,
             device=config.WHISPER_DEVICE,
@@ -100,11 +167,12 @@ def transcribe_audio(video_path: Path) -> str:
             vad_filter=config.WHISPER_VAD,
         )
         logger.info("Язык аудио: %s", info.language)
-        lines = [
-            f"[{format_timestamp(seg.start)}] {seg.text.strip()}"
-            for seg in segments
-            if seg.text.strip()
-        ]
+        lines = []
+        for seg in segments:
+            report(D_SPEECH, seg.end / max(info.duration, 1.0), "Распознавание")
+            if seg.text.strip():
+                lines.append(
+                    f"[{format_timestamp(seg.start)}] {seg.text.strip()}")
         return "\n".join(lines)
     except Exception as exc:
         logger.error("Ошибка распознавания речи: %s", exc)
@@ -119,6 +187,7 @@ def extract_frames(
     """Извлекает кадр каждые `interval` секунд в temp_dir/frames/."""
     frames_dir = Path(temp_dir) / "frames"
     try:
+        report(D_FRAMES, 0.0, "Извлечение кадров")
         frames_dir.mkdir(parents=True, exist_ok=True)
         run_ffmpeg(
             ["-i", str(video_path), "-vf", f"fps=1/{interval}", "-q:v", "2",
@@ -212,7 +281,10 @@ def extract_code_from_frames(
 
         blocks = []
         seen = []
-        for index, frame in enumerate(sorted(Path(frames_dir).glob("*.jpg"))):
+        frames = sorted(Path(frames_dir).glob("*.jpg"))
+        for index, frame in enumerate(frames):
+            report(D_OCR, index / max(len(frames), 1),
+                   f"Кадр {index + 1} из {len(frames)}")
             try:
                 with Image.open(frame) as img:
                     gray = ImageOps.autocontrast(img.convert("L"))
@@ -249,35 +321,61 @@ def _truncate(text: str, limit: int) -> str:
     return f"{text[:half]}\n[...пропущено...]\n{text[-half:]}"
 
 
-def _chat(prompt: str, max_tokens: int, json_schema: Optional[dict] = None) -> str:
-    """Отправляет один запрос в LM Studio и возвращает текст ответа.
+def _is_context_error(text: str) -> bool:
+    """Распознаёт ответ LM Studio о переполнении контекста."""
+    low = text.lower()
+    return any(word in low for word in ("context", "n_keep", "tokens"))
 
-    При переполнении контекста (HTTP 400) сокращает запрос вдвое и повторяет.
+
+def _chat(prompt: str, max_tokens: int, json_schema: Optional[dict] = None) -> str:
+    """Отправляет один запрос текущей модели LM Studio, возвращает ответ.
+
+    - переполнение контекста (HTTP 400): запрос сокращается вдвое;
+    - модель не поддерживает json-схему: повтор с просьбой ответить JSON;
+    - блоки <think> reasoning-моделей вырезаются.
     """
+    check_cancel()
+    model = lmstudio.active["id"] or config.LM_STUDIO_MODEL
     payload = {
-        "model": config.LM_STUDIO_MODEL,
+        "model": model,
         "temperature": config.LM_STUDIO_TEMPERATURE,
         "max_tokens": max_tokens,
         "stream": False,
     }
-    if json_schema:
-        payload["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "note_meta", "strict": True,
-                            "schema": json_schema},
-        }
-    for attempt in range(config.LM_STUDIO_MAX_RETRIES + 1):
+    use_schema = json_schema is not None
+    attempts = config.LM_STUDIO_MAX_RETRIES + 2
+    for attempt in range(attempts):
         payload["messages"] = [{"role": "user", "content": prompt}]
+        if use_schema:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "note_meta", "strict": True,
+                                "schema": json_schema},
+            }
+        else:
+            payload.pop("response_format", None)
         response = requests.post(
-            config.LM_STUDIO_URL, json=payload, timeout=config.LM_STUDIO_TIMEOUT
+            config.LM_STUDIO_URL, json=payload, headers=lmstudio.headers(),
+            timeout=config.LM_STUDIO_TIMEOUT,
         )
-        if response.status_code == 400 and attempt < config.LM_STUDIO_MAX_RETRIES:
+        if response.status_code in (401, 403):
+            raise lmstudio.LMStudioAuthError("Нужен API-токен LM Studio")
+        if response.status_code == 400 and attempt < attempts - 1:
+            if use_schema and not _is_context_error(response.text):
+                use_schema = False
+                prompt += "\n\nОтветь только JSON-объектом без пояснений."
+                logger.warning("Модель не приняла json-схему, повтор без неё")
+                continue
             prompt = _truncate(prompt, len(prompt) // 2)
-            logger.warning("Запрос не принят (контекст?), повтор с меньшим "
-                           "входом (%d символов)", len(prompt))
+            logger.warning("Контекст модели мал, повтор с меньшим входом "
+                           "(%d символов)", len(prompt))
             continue
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+        text = lmstudio.strip_reasoning(
+            response.json()["choices"][0]["message"]["content"])
+        if not text:
+            raise RuntimeError("Модель вернула пустой ответ")
+        return text
     raise RuntimeError("LM Studio не вернула ответ")
 
 
@@ -301,13 +399,16 @@ def _split_transcript(transcript: str, size: int) -> list:
 
 
 def _parse_section(answer: str, index: int) -> tuple:
-    """Отделяет заголовок раздела (первая строка) от текста."""
+    """Отделяет заголовок раздела (первая строка) от текста, убирает воду."""
     lines = answer.strip().splitlines()
     heading = lines[0].strip(" #*:-") if lines else ""
     body = "\n".join(lines[1:]).strip()
     if not heading or len(heading) > 80 or not body:
         heading, body = f"Часть {index}", answer.strip()
     body = re.sub(r"(?m)^#{1,6}\s+(.*)$", r"**\1**", body)
+    body = "\n".join(
+        line for line in body.splitlines() if not _FILLER_RE.match(line)
+    ).strip()
     return heading, body
 
 
@@ -325,50 +426,50 @@ def _normalize_meta(raw: dict, fallback_title: str) -> dict:
         for c in raw.get("concepts", [])
         if isinstance(c, dict) and str(c.get("term", "")).strip()
         and str(c.get("definition", "")).strip()
-    ][:12]
+    ][:10]
     questions = [
         {"question": str(q["question"]).strip(), "answer": str(q["answer"]).strip()}
         for q in raw.get("questions", [])
         if isinstance(q, dict) and str(q.get("question", "")).strip()
         and str(q.get("answer", "")).strip()
-    ][:6]
+    ][:5]
     return {
         "title": str(raw.get("title") or fallback_title).strip(),
         "tldr": str(raw.get("tldr") or "").strip(),
         "tags": _as_list(raw.get("tags"))[:7],
         "difficulty": str(raw.get("difficulty") or "").strip(),
-        "prerequisites": _as_list(raw.get("prerequisites"))[:5],
+        "prerequisites": _as_list(raw.get("prerequisites"))[:4],
         "concepts": concepts,
-        "steps": _as_list(raw.get("steps"))[:10],
+        "steps": _as_list(raw.get("steps"))[:8],
         "questions": questions,
-        "action_items": _as_list(raw.get("action_items"))[:6],
+        "action_items": _as_list(raw.get("action_items"))[:4],
     }
 
 
-def _generate_meta(notes: str, video_title: str) -> dict:
+def _generate_meta(notes: str, video_title: str, size: dict) -> dict:
     """Просит модель выделить название, теги, понятия, вопросы и т.д."""
     prompt = config.META_PROMPT.format(
         video_title=video_title,
-        notes=_truncate(notes, config.MAX_NOTES_CHARS),
+        notes=_truncate(notes, size["meta_chars"]),
     )
-    answer = _chat(prompt, config.MAX_TOKENS_META, json_schema=config.META_SCHEMA)
+    answer = _chat(prompt, size["meta_tokens"], json_schema=config.META_SCHEMA)
     start, end = answer.find("{"), answer.rfind("}")
     return _normalize_meta(json.loads(answer[start:end + 1]), video_title)
 
 
-def _generate_code_notes(ocr_text: str, video_title: str) -> str:
+def _generate_code_notes(ocr_text: str, video_title: str, size: dict) -> str:
     """Просит модель оформить и объяснить код, найденный на экране."""
     blocks = ocr_text.split("\n\n")
     chunks, current = [], ""
     for block in blocks:
-        if current and len(current) + len(block) > config.OCR_CHUNK_CHARS:
+        if current and len(current) + len(block) > size["ocr_chars"]:
             chunks.append(current)
             current = ""
         current += block + "\n\n"
     chunks.append(current)
     answers = [
         _chat(config.CODE_PROMPT.format(video_title=video_title, ocr=chunk),
-              config.MAX_TOKENS_CODE)
+              size["code_tokens"])
         for chunk in chunks if chunk.strip()
     ]
     return "\n\n".join(answers)
@@ -379,28 +480,38 @@ def summarize_with_lm_studio(
 ) -> dict:
     """Строит конспект через LM Studio поэтапно.
 
-    Возвращает {"meta": ..., "sections": [(секунда, заголовок, текст)],
-    "code_md": ...}. Если LM Studio недоступна, выбрасывает исключение.
+    Использует модель, загруженную в LM Studio сейчас (или заданную в
+    config.LM_STUDIO_MODEL). Возвращает {"meta": ..., "sections":
+    [(секунда, заголовок, текст)], "code_md": ...}. Если LM Studio
+    недоступна, выбрасывает исключение.
     """
     info = info or {}
     video_title = info.get("title") or "Видео"
     try:
-        chunks = _split_transcript(transcript, config.CHUNK_CHARS)
+        model = lmstudio.activate(config.LM_STUDIO_MODEL)
+        logger.info("Модель: %s (контекст %s)", model["id"],
+                    model["context"] or "неизвестен")
+        size = lmstudio.budgets(model["context"])
+
+        chunks = _split_transcript(transcript, size["chunk_chars"])
+        steps = len(chunks) + 1 + (1 if ocr_text.strip() else 0)
         sections = []
         for i, (start, chunk) in enumerate(chunks, 1):
+            report(D_SUMMARY, (i - 1) / steps, f"Часть {i} из {len(chunks)}")
             logger.info("Конспект: часть %d из %d...", i, len(chunks))
             answer = _chat(
                 config.SECTION_PROMPT.format(
                     video_title=video_title, index=i, total=len(chunks),
                     chunk=chunk),
-                config.MAX_TOKENS_SECTION,
+                size["section_tokens"],
             )
             sections.append((start, *_parse_section(answer, i)))
 
         notes = "\n\n".join(f"{h}\n{b}" for _, h, b in sections)
+        report(D_SUMMARY, len(chunks) / steps, "Название, теги, понятия")
         try:
             logger.info("Метаданные: название, теги, понятия, вопросы...")
-            meta = _generate_meta(notes or ocr_text, video_title)
+            meta = _generate_meta(notes or ocr_text, video_title, size)
         except (requests.ConnectionError, requests.Timeout):
             raise
         except Exception as exc:
@@ -410,16 +521,18 @@ def summarize_with_lm_studio(
 
         code_md = ""
         if ocr_text.strip():
+            report(D_SUMMARY, (steps - 1) / steps, "Пояснения к коду")
             logger.info("Пояснения к коду...")
             try:
-                code_md = _generate_code_notes(ocr_text, video_title)
+                code_md = _generate_code_notes(ocr_text, video_title, size)
             except (requests.ConnectionError, requests.Timeout):
                 raise
             except Exception as exc:
                 logger.warning("Пояснения к коду не получены: %s", exc)
                 code_md = f"```\n{ocr_text}\n```"
         return {"meta": meta, "sections": sections, "code_md": code_md}
-    except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
+    except (requests.RequestException, KeyError, IndexError, ValueError,
+            lmstudio.LMStudioError) as exc:
         logger.error("Ошибка запроса к LM Studio: %s", exc)
         raise
 
@@ -447,6 +560,8 @@ def parse_args() -> argparse.Namespace:
                         help="Интервал между кадрами, сек")
     parser.add_argument("--whisper-model", default=None,
                         help="Модель Whisper (base, small, ...)")
+    parser.add_argument("--model", default=None,
+                        help="Модель LM Studio (по умолчанию — загруженная сейчас)")
     parser.add_argument("--keep-temp", action="store_true",
                         help="Не удалять временные файлы")
     parser.add_argument("--no-concepts", action="store_true",
@@ -467,7 +582,7 @@ def run_pipeline(
     """Выполняет весь процесс; возвращает (статус, путь к результату).
 
     Статус: "ok" — заметка создана, "raw" — LM Studio недоступна и сохранён
-    сырой текст, "error" — результата нет.
+    сырой текст, "cancelled" — отмена, "error" — результата нет.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -475,6 +590,7 @@ def run_pipeline(
 
     try:
         logger.info("Скачивание видео...")
+        report(D_DOWNLOAD, 0.0)
         downloaded = download_video(url, temp_dir)
         if downloaded is None:
             return "error", None
@@ -494,15 +610,20 @@ def run_pipeline(
             return "error", None
 
         logger.info("Генерация конспекта...")
+        report(D_SUMMARY, 0.0)
         try:
             parts = summarize_with_lm_studio(transcript, ocr_text, info)
-        except Exception:
+        except Exception as exc:
             raw_path = save_raw_text(output_dir, transcript, ocr_text)
-            logger.error(
-                "LM Studio недоступна. Сырой текст сохранён: %s", raw_path
+            reason = (
+                "LM Studio требует API-токен (Настройки → API-токен)"
+                if isinstance(exc, lmstudio.LMStudioAuthError)
+                else "LM Studio недоступна или в ней не загружена модель"
             )
+            logger.error("%s. Сырой текст сохранён: %s", reason, raw_path)
             return "raw", raw_path
 
+        report(D_SAVE, 0.0, "Сохранение заметки")
         title, text = obsidian_note.render_note(
             parts, info, transcript, has_code=bool(ocr_text.strip()),
             include_transcript=include_transcript,
@@ -513,8 +634,12 @@ def run_pipeline(
             obsidian_note.write_concept_stubs(
                 output_dir, parts["meta"]["concepts"], note_path.stem
             )
+        report(D_SAVE, 1.0, "Готово")
         logger.info("Готово: %s", note_path)
         return "ok", note_path
+    except Cancelled:
+        logger.info("Обработка отменена")
+        return "cancelled", None
     finally:
         if keep_temp:
             logger.info("Временные файлы: %s", temp_dir)
@@ -528,12 +653,14 @@ def main() -> int:
     args = parse_args()
     if args.whisper_model:
         config.WHISPER_MODEL = args.whisper_model
+    if args.model:
+        config.LM_STUDIO_MODEL = args.model
     status, _ = run_pipeline(
         args.url, Path(args.output), args.interval, args.keep_temp,
         make_concepts=not args.no_concepts,
         include_transcript=not args.no_transcript,
     )
-    return 1 if status == "error" else 0
+    return 1 if status in ("error", "cancelled") else 0
 
 
 if __name__ == "__main__":
